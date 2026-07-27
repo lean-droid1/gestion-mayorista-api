@@ -20,7 +20,11 @@ INSERT INTO configuracion (clave, valor) VALUES
   ('compra_minima_activa', 'false'),
   ('compra_minima_monto', '0'),
   ('compra_minima_promo', ''),
-  ('dolar_manual', '0')
+  ('dolar_manual', '0'),
+  ('mantenimiento_activo', 'false'),
+  ('mantenimiento_mensaje', 'Estamos en mantenimiento, volvemos pronto'),
+  ('mantenimiento_countdown', ''),
+  ('vitrina_texto', 'Ingresá o registrate para ver precios')
 ON CONFLICT (clave) DO NOTHING;
 
 -- Listas de precio (porcentajes de aumento sobre base)
@@ -52,6 +56,7 @@ CREATE TABLE IF NOT EXISTS usuarios (
   rol VARCHAR(20) NOT NULL DEFAULT 'cliente',  -- admin | cliente
   lista_precio_id INT REFERENCES listas_precio(id) DEFAULT 4,
   activo BOOLEAN NOT NULL DEFAULT true,
+  aprobado BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

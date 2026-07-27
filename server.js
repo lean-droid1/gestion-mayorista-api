@@ -19,26 +19,60 @@ const pool = new Pool({
 app.use(cors({ origin: [FRONTEND_URL, 'http://localhost:5173', 'http://localhost:4173'], credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
-// ── Auth middleware ──
+// ── Auth middleware (requiere login + aprobado) ──
 function auth(requiredRole) {
   return async (req, res, next) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Token requerido' });
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
-      const { rows } = await pool.query('SELECT id, usuario, nombre, rol, lista_precio_id, activo FROM usuarios WHERE id = $1', [decoded.id]);
+      const { rows } = await pool.query('SELECT id, usuario, nombre, rol, lista_precio_id, activo, aprobado FROM usuarios WHERE id = $1', [decoded.id]);
       if (!rows[0] || !rows[0].activo) return res.status(401).json({ error: 'Usuario no válido' });
       if (requiredRole === 'admin' && rows[0].rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado' });
+      // Admin siempre pasa; clientes necesitan estar aprobados
+      if (rows[0].rol !== 'admin' && !rows[0].aprobado) return res.status(403).json({ error: 'Cuenta pendiente de aprobación', pendiente: true });
       req.user = rows[0];
       next();
     } catch { return res.status(401).json({ error: 'Token inválido' }); }
   };
 }
 
+// ── Auth opcional (para vitrina: no falla si no hay token) ──
+async function optionalAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) { req.user = null; return next(); }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { rows } = await pool.query('SELECT id, usuario, nombre, rol, lista_precio_id, activo, aprobado FROM usuarios WHERE id = $1', [decoded.id]);
+    req.user = (rows[0] && rows[0].activo && rows[0].aprobado) ? rows[0] : null;
+    // Admin siempre tiene acceso
+    if (rows[0] && rows[0].rol === 'admin') req.user = rows[0];
+  } catch { req.user = null; }
+  next();
+}
+
 // ══════════════════════════════════════
 // HEALTH
 // ══════════════════════════════════════
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+// ══════════════════════════════════════
+// MODO MANTENIMIENTO (público)
+// ══════════════════════════════════════
+app.get('/api/maintenance-status', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT clave, valor FROM configuracion WHERE clave IN ('mantenimiento_activo', 'mantenimiento_mensaje', 'mantenimiento_countdown')"
+    );
+    const config = {};
+    rows.forEach(r => config[r.clave] = r.valor);
+    res.json({
+      activo: config.mantenimiento_activo === 'true',
+      mensaje: config.mantenimiento_mensaje || 'Estamos en mantenimiento',
+      countdown: config.mantenimiento_countdown || null,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // ══════════════════════════════════════
 // AUTH
@@ -50,6 +84,15 @@ app.post('/api/auth/login', async (req, res) => {
     if (!rows[0]) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
     const valid = await bcrypt.compare(password, rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+
+    // Admin siempre puede entrar; clientes necesitan aprobación
+    if (rows[0].rol !== 'admin' && !rows[0].aprobado) {
+      return res.status(403).json({
+        error: 'Tu cuenta está pendiente de aprobación por el administrador',
+        pendiente: true,
+      });
+    }
+
     const token = jwt.sign({ id: rows[0].id, rol: rows[0].rol }, JWT_SECRET, { expiresIn: '30d' });
     const { password_hash, ...user } = rows[0];
     res.json({ token, user });
@@ -60,22 +103,31 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { usuario, password, nombre, telefono, email, direccion } = req.body;
     if (!usuario || !password) return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
+    if (!nombre) return res.status(400).json({ error: 'Nombre requerido' });
+    if (!telefono) return res.status(400).json({ error: 'Teléfono/WhatsApp requerido' });
+
     const exists = await pool.query('SELECT id FROM usuarios WHERE usuario = $1', [usuario]);
     if (exists.rows[0]) return res.status(409).json({ error: 'El usuario ya existe' });
+
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      'INSERT INTO usuarios (usuario, password_hash, nombre, telefono, email, direccion, rol, lista_precio_id) VALUES ($1,$2,$3,$4,$5,$6,$7,4) RETURNING *',
-      [usuario, hash, nombre || '', telefono || '', email || '', direccion || '', 'cliente']
+      'INSERT INTO usuarios (usuario, password_hash, nombre, telefono, email, direccion, rol, lista_precio_id, aprobado) VALUES ($1,$2,$3,$4,$5,$6,$7,4,$8) RETURNING *',
+      [usuario, hash, nombre, telefono || '', email || '', direccion || '', 'cliente', false]
     );
     const { password_hash, ...user } = rows[0];
-    const token = jwt.sign({ id: user.id, rol: user.rol }, JWT_SECRET, { expiresIn: '30d' });
-    res.status(201).json({ token, user });
+
+    // Devolver datos del usuario para que el frontend arme el WhatsApp al admin
+    res.status(201).json({
+      pendiente: true,
+      mensaje: 'Registro exitoso. Tu cuenta será revisada por el administrador.',
+      user: { nombre: user.nombre, usuario: user.usuario, telefono: user.telefono, email: user.email },
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/auth/me', auth(), async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, created_at FROM usuarios WHERE id = $1', [req.user.id]);
+    const { rows } = await pool.query('SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, aprobado, created_at FROM usuarios WHERE id = $1', [req.user.id]);
     res.json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -138,9 +190,9 @@ app.put('/api/listas', auth('admin'), async (req, res) => {
 });
 
 // ══════════════════════════════════════
-// PRODUCTOS
+// PRODUCTOS (vitrina pública sin precios)
 // ══════════════════════════════════════
-app.get('/api/productos', async (req, res) => {
+app.get('/api/productos', optionalAuth, async (req, res) => {
   try {
     const { q, categoria, page = 1, limit = 50 } = req.query;
     let where = 'WHERE activo = true';
@@ -163,7 +215,11 @@ app.get('/api/productos', async (req, res) => {
       [...params, parseInt(limit), offset]
     );
 
-    res.json({ productos: rows, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) });
+    // Si NO está logueado/aprobado → quitar precios (vitrina)
+    const showPrices = req.user !== null;
+    const productos = showPrices ? rows : rows.map(({ precio_base, ...rest }) => rest);
+
+    res.json({ productos, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)), vitrina: !showPrices });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -235,7 +291,7 @@ app.delete('/api/productos/all/clear', auth('admin'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Resetear precios a originales (necesita precio_original guardado)
+// Resetear precios a originales
 app.post('/api/productos/reset-precios', auth('admin'), async (req, res) => {
   try {
     await pool.query('DELETE FROM precios_fijos');
@@ -243,11 +299,10 @@ app.post('/api/productos/reset-precios', auth('admin'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Ajustar precios por porcentaje (global, por categoría, o por lista)
+// Ajustar precios por porcentaje
 app.post('/api/productos/ajustar-precios', auth('admin'), async (req, res) => {
   try {
     const { porcentaje, categoria, lista_id } = req.body;
-    // Ajusta el precio_base de los productos
     let query = 'UPDATE productos SET precio_base = precio_base * (1 + $1 / 100.0) WHERE activo = true';
     const params = [porcentaje];
     if (categoria) { query += ' AND categoria = $2'; params.push(categoria); }
@@ -287,27 +342,56 @@ app.put('/api/precios-fijos', auth('admin'), async (req, res) => {
 app.get('/api/usuarios', auth('admin'), async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, activo, created_at FROM usuarios ORDER BY created_at DESC'
+      'SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, created_at FROM usuarios ORDER BY aprobado ASC, created_at DESC'
     );
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Contador de pendientes (para badge en el menú admin)
+app.get('/api/usuarios/pendientes/count', auth('admin'), async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado = false AND activo = true AND rol = 'cliente'");
+    res.json({ count: parseInt(rows[0].count) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.put('/api/usuarios/:id', auth('admin'), async (req, res) => {
   try {
-    const { nombre, telefono, email, direccion, rol, lista_precio_id, activo, password } = req.body;
+    const { nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, password } = req.body;
     if (password) {
       const hash = await bcrypt.hash(password, 10);
       await pool.query(
-        'UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, rol=$5, lista_precio_id=$6, activo=$7, password_hash=$8, updated_at=NOW() WHERE id=$9',
-        [nombre, telefono, email, direccion, rol, lista_precio_id, activo, hash, req.params.id]
+        'UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, rol=$5, lista_precio_id=$6, activo=$7, aprobado=$8, password_hash=$9, updated_at=NOW() WHERE id=$10',
+        [nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, hash, req.params.id]
       );
     } else {
       await pool.query(
-        'UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, rol=$5, lista_precio_id=$6, activo=$7, updated_at=NOW() WHERE id=$8',
-        [nombre, telefono, email, direccion, rol, lista_precio_id, activo, req.params.id]
+        'UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, rol=$5, lista_precio_id=$6, activo=$7, aprobado=$8, updated_at=NOW() WHERE id=$9',
+        [nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, req.params.id]
       );
     }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Aprobación rápida (un solo click desde el panel)
+app.post('/api/usuarios/:id/aprobar', auth('admin'), async (req, res) => {
+  try {
+    const { lista_precio_id } = req.body;
+    await pool.query(
+      'UPDATE usuarios SET aprobado = true, lista_precio_id = $1, updated_at = NOW() WHERE id = $2',
+      [lista_precio_id || 4, req.params.id]
+    );
+    const { rows } = await pool.query('SELECT id, usuario, nombre, telefono, email, aprobado, lista_precio_id FROM usuarios WHERE id = $1', [req.params.id]);
+    res.json({ ok: true, user: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Rechazar usuario (desactivar)
+app.post('/api/usuarios/:id/rechazar', auth('admin'), async (req, res) => {
+  try {
+    await pool.query('UPDATE usuarios SET activo = false, updated_at = NOW() WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -405,6 +489,7 @@ app.get('/api/stats', auth('admin'), async (req, res) => {
     const totalProductos = (await pool.query('SELECT COUNT(*) FROM productos WHERE activo = true')).rows[0].count;
     const totalUsuarios = (await pool.query('SELECT COUNT(*) FROM usuarios WHERE activo = true')).rows[0].count;
     const totalPedidos = (await pool.query('SELECT COUNT(*) FROM pedidos')).rows[0].count;
+    const pendientesAprobacion = (await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado = false AND activo = true AND rol = 'cliente'")).rows[0].count;
     const ventasHoy = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE AND estado_pago = 'pagado'")).rows[0].total;
     const ventasSemana = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE - INTERVAL '7 days' AND estado_pago = 'pagado'")).rows[0].total;
     const ventasMes = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE - INTERVAL '30 days' AND estado_pago = 'pagado'")).rows[0].total;
@@ -417,7 +502,7 @@ app.get('/api/stats', auth('admin'), async (req, res) => {
       GROUP BY u.id, u.nombre, u.usuario ORDER BY total DESC LIMIT 10
     `);
 
-    res.json({ totalProductos, totalUsuarios, totalPedidos, ventasHoy, ventasSemana, ventasMes, topClientes });
+    res.json({ totalProductos, totalUsuarios, totalPedidos, pendientesAprobacion, ventasHoy, ventasSemana, ventasMes, topClientes });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
