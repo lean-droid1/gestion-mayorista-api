@@ -21,6 +21,11 @@ const pool = new Pool({
     await pool.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS metodo_pago VARCHAR(50) NOT NULL DEFAULT ''");
     await pool.query("ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS color VARCHAR(20) NOT NULL DEFAULT '#2563eb'");
     await pool.query("ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS promo_msg TEXT NOT NULL DEFAULT ''");
+    await pool.query("INSERT INTO configuracion (clave, valor) VALUES ('metodos_pago', '') ON CONFLICT (clave) DO NOTHING");
+    await pool.query("ALTER TABLE productos ADD COLUMN IF NOT EXISTS compatibilidad TEXT NOT NULL DEFAULT ''");
+    await pool.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS tipo VARCHAR(20) NOT NULL DEFAULT 'pedido'");
+    await pool.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS archivado BOOLEAN NOT NULL DEFAULT false");
+    await pool.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS asignado_usuario_id INT REFERENCES usuarios(id)");
     console.log('[DB] Migrations OK');
   } catch (e) { console.log('[DB] Migration note:', e.message); }
 })();
@@ -216,7 +221,7 @@ app.get('/api/productos', optionalAuth, async (req, res) => {
 
     if (categoria) { where += ` AND categoria = $${i++}`; params.push(categoria); }
     if (q) {
-      where += ` AND (nombre ILIKE $${i} OR modelo ILIKE $${i} OR categoria ILIKE $${i})`;
+      where += ` AND (nombre ILIKE $${i} OR modelo ILIKE $${i} OR categoria ILIKE $${i} OR compatibilidad ILIKE $${i})`;
       params.push(`%${q}%`);
       i++;
     }
@@ -258,9 +263,9 @@ app.post('/api/productos', auth('admin'), async (req, res) => {
 
 app.put('/api/productos/:id', auth('admin'), async (req, res) => {
   try {
-    const { nombre, modelo, categoria, precio_base } = req.body;
-    await pool.query('UPDATE productos SET nombre=$1, modelo=$2, categoria=$3, precio_base=$4 WHERE id=$5',
-      [nombre, modelo, categoria, precio_base, req.params.id]);
+    const { nombre, modelo, categoria, precio_base, compatibilidad } = req.body;
+    await pool.query('UPDATE productos SET nombre=$1, modelo=$2, categoria=$3, precio_base=$4, compatibilidad=$5 WHERE id=$6',
+      [nombre, modelo, categoria, precio_base, compatibilidad || '', req.params.id]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -428,12 +433,17 @@ app.delete('/api/usuarios/:id', auth('admin'), async (req, res) => {
 // ══════════════════════════════════════
 app.get('/api/pedidos', auth(), async (req, res) => {
   try {
+    const { tipo, archivado } = req.query;
+    const showArchived = archivado === 'true';
     let query, params;
+    let whereExtra = showArchived ? '' : ' AND p.archivado = false';
+    if (tipo) { whereExtra += ` AND p.tipo = '${tipo === 'presupuesto' ? 'presupuesto' : 'pedido'}'`; }
     if (req.user.rol === 'admin') {
       query = `SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, COALESCE(ic.item_count, 0) as item_count
                FROM pedidos p
                LEFT JOIN usuarios u ON u.id = p.usuario_id
                LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
+               WHERE 1=1 ${whereExtra}
                ORDER BY p.created_at DESC`;
       params = [];
     } else {
@@ -441,7 +451,7 @@ app.get('/api/pedidos', auth(), async (req, res) => {
                FROM pedidos p
                LEFT JOIN usuarios u ON u.id = p.usuario_id
                LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
-               WHERE p.usuario_id = $1 ORDER BY p.created_at DESC`;
+               WHERE p.usuario_id = $1 ${whereExtra} ORDER BY p.created_at DESC`;
       params = [req.user.id];
     }
     const { rows } = await pool.query(query, params);
@@ -452,8 +462,11 @@ app.get('/api/pedidos', auth(), async (req, res) => {
 app.get('/api/pedidos/:id', auth(), async (req, res) => {
   try {
     const { rows: [pedido] } = await pool.query(
-      `SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono
-       FROM pedidos p LEFT JOIN usuarios u ON u.id = p.usuario_id WHERE p.id = $1`, [req.params.id]);
+      `SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono,
+       au.nombre as asignado_nombre, au.telefono as asignado_telefono
+       FROM pedidos p LEFT JOIN usuarios u ON u.id = p.usuario_id
+       LEFT JOIN usuarios au ON au.id = p.asignado_usuario_id
+       WHERE p.id = $1`, [req.params.id]);
     if (!pedido) return res.status(404).json({ error: 'Pedido no encontrado' });
     if (req.user.rol !== 'admin' && pedido.usuario_id !== req.user.id) return res.status(403).json({ error: 'Acceso denegado' });
     const { rows: items } = await pool.query('SELECT * FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
@@ -463,12 +476,12 @@ app.get('/api/pedidos/:id', auth(), async (req, res) => {
 
 app.post('/api/pedidos', auth(), async (req, res) => {
   try {
-    const { tipo_entrega, direccion_envio, notas, items, lista_precio_nombre, metodo_pago } = req.body;
+    const { tipo_entrega, direccion_envio, notas, items, lista_precio_nombre, metodo_pago, tipo, asignado_usuario_id } = req.body;
     const total = items.reduce((sum, it) => sum + (it.precio_unitario * it.cantidad), 0);
     const { rows: [pedido] } = await pool.query(
-      `INSERT INTO pedidos (usuario_id, cliente_nombre, cliente_telefono, tipo_entrega, direccion_envio, notas, total, lista_precio_nombre, metodo_pago)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [req.user.id, req.user.nombre, req.user.telefono || '', tipo_entrega || 'retiro', direccion_envio || '', notas || '', total, lista_precio_nombre || '', metodo_pago || '']
+      `INSERT INTO pedidos (usuario_id, cliente_nombre, cliente_telefono, tipo_entrega, direccion_envio, notas, total, lista_precio_nombre, metodo_pago, tipo, asignado_usuario_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [req.user.id, req.user.nombre, req.user.telefono || '', tipo_entrega || 'retiro', direccion_envio || '', notas || '', total, lista_precio_nombre || '', metodo_pago || '', tipo || 'pedido', asignado_usuario_id || null]
     );
     for (const it of items) {
       await pool.query(
@@ -482,16 +495,27 @@ app.post('/api/pedidos', auth(), async (req, res) => {
 
 app.put('/api/pedidos/:id', auth('admin'), async (req, res) => {
   try {
-    const { estado, estado_pago, notas, items, metodo_pago } = req.body;
+    const { estado, estado_pago, notas, items, metodo_pago, tipo, asignado_usuario_id } = req.body;
     // Merge with existing values to avoid null constraint violations
-    const { rows: [existing] } = await pool.query('SELECT estado, estado_pago, notas, metodo_pago FROM pedidos WHERE id = $1', [req.params.id]);
+    const { rows: [existing] } = await pool.query('SELECT estado, estado_pago, notas, metodo_pago, tipo FROM pedidos WHERE id = $1', [req.params.id]);
     if (!existing) return res.status(404).json({ error: 'Pedido no encontrado' });
     const newEstado = estado !== undefined ? estado : existing.estado;
     const newEstadoPago = estado_pago !== undefined ? estado_pago : existing.estado_pago;
     const newNotas = notas !== undefined ? notas : existing.notas;
     const newMetodoPago = metodo_pago !== undefined ? metodo_pago : (existing.metodo_pago || '');
-    await pool.query('UPDATE pedidos SET estado=$1, estado_pago=$2, notas=$3, metodo_pago=$4, updated_at=NOW() WHERE id=$5',
-      [newEstado, newEstadoPago, newNotas, newMetodoPago, req.params.id]);
+    const newTipo = tipo !== undefined ? tipo : (existing.tipo || 'pedido');
+    await pool.query('UPDATE pedidos SET estado=$1, estado_pago=$2, notas=$3, metodo_pago=$4, tipo=$5, updated_at=NOW() WHERE id=$6',
+      [newEstado, newEstadoPago, newNotas, newMetodoPago, newTipo, req.params.id]);
+    if (asignado_usuario_id !== undefined) {
+      await pool.query('UPDATE pedidos SET asignado_usuario_id=$1, updated_at=NOW() WHERE id=$2', [asignado_usuario_id || null, req.params.id]);
+      // Also update cliente_nombre/telefono from assigned user
+      if (asignado_usuario_id) {
+        const { rows: [assignedUser] } = await pool.query('SELECT nombre, telefono FROM usuarios WHERE id = $1', [asignado_usuario_id]);
+        if (assignedUser) {
+          await pool.query('UPDATE pedidos SET cliente_nombre=$1, cliente_telefono=$2 WHERE id=$3', [assignedUser.nombre, assignedUser.telefono || '', req.params.id]);
+        }
+      }
+    }
 
     if (items) {
       await pool.query('DELETE FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
@@ -510,6 +534,20 @@ app.put('/api/pedidos/:id', auth('admin'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.post('/api/pedidos/:id/archivar', auth('admin'), async (req, res) => {
+  try {
+    await pool.query('UPDATE pedidos SET archivado = true, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/pedidos/:id/desarchivar', auth('admin'), async (req, res) => {
+  try {
+    await pool.query('UPDATE pedidos SET archivado = false, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.delete('/api/pedidos/:id', auth('admin'), async (req, res) => {
   try {
     await pool.query('DELETE FROM pedidos WHERE id = $1', [req.params.id]);
@@ -524,11 +562,11 @@ app.get('/api/stats', auth('admin'), async (req, res) => {
   try {
     const totalProductos = (await pool.query('SELECT COUNT(*) FROM productos WHERE activo = true')).rows[0].count;
     const totalUsuarios = (await pool.query('SELECT COUNT(*) FROM usuarios WHERE activo = true')).rows[0].count;
-    const totalPedidos = (await pool.query('SELECT COUNT(*) FROM pedidos')).rows[0].count;
+    const totalPedidos = (await pool.query("SELECT COUNT(*) FROM pedidos WHERE archivado = false AND tipo = 'pedido'")).rows[0].count;
     const pendientesAprobacion = (await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado = false AND activo = true AND rol = 'cliente'")).rows[0].count;
-    const ventasHoy = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE AND estado_pago = 'pagado'")).rows[0].total;
-    const ventasSemana = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE - INTERVAL '7 days' AND estado_pago = 'pagado'")).rows[0].total;
-    const ventasMes = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE - INTERVAL '30 days' AND estado_pago = 'pagado'")).rows[0].total;
+    const ventasHoy = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE AND estado_pago = 'pagado' AND archivado = false AND tipo = 'pedido'")).rows[0].total;
+    const ventasSemana = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE - INTERVAL '7 days' AND estado_pago = 'pagado' AND archivado = false AND tipo = 'pedido'")).rows[0].total;
+    const ventasMes = (await pool.query("SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE created_at >= CURRENT_DATE - INTERVAL '30 days' AND estado_pago = 'pagado' AND archivado = false AND tipo = 'pedido'")).rows[0].total;
 
     // Top clientes
     const { rows: topClientes } = await pool.query(`
