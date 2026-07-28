@@ -201,7 +201,7 @@ app.get('/api/productos', optionalAuth, async (req, res) => {
 
     if (categoria) { where += ` AND categoria = $${i++}`; params.push(categoria); }
     if (q) {
-      where += ` AND (nombre ILIKE $${i} OR modelo ILIKE $${i})`;
+      where += ` AND (nombre ILIKE $${i} OR modelo ILIKE $${i} OR categoria ILIKE $${i})`;
       params.push(`%${q}%`);
       i++;
     }
@@ -342,7 +342,11 @@ app.put('/api/precios-fijos', auth('admin'), async (req, res) => {
 app.get('/api/usuarios', auth('admin'), async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, created_at FROM usuarios ORDER BY aprobado ASC, created_at DESC'
+      `SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, created_at,
+       CASE WHEN aprobado = false AND activo = true AND rol = 'cliente' THEN 'pendiente'
+            WHEN activo = false THEN 'suspendido'
+            ELSE 'activo' END as estado
+       FROM usuarios ORDER BY aprobado ASC, created_at DESC`
     );
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -411,10 +415,14 @@ app.get('/api/pedidos', auth(), async (req, res) => {
   try {
     let query, params;
     if (req.user.rol === 'admin') {
-      query = 'SELECT * FROM pedidos ORDER BY created_at DESC';
+      query = `SELECT p.*, COALESCE(ic.item_count, 0) as item_count
+               FROM pedidos p LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
+               ORDER BY p.created_at DESC`;
       params = [];
     } else {
-      query = 'SELECT * FROM pedidos WHERE usuario_id = $1 ORDER BY created_at DESC';
+      query = `SELECT p.*, COALESCE(ic.item_count, 0) as item_count
+               FROM pedidos p LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
+               WHERE p.usuario_id = $1 ORDER BY p.created_at DESC`;
       params = [req.user.id];
     }
     const { rows } = await pool.query(query, params);
@@ -454,8 +462,14 @@ app.post('/api/pedidos', auth(), async (req, res) => {
 app.put('/api/pedidos/:id', auth('admin'), async (req, res) => {
   try {
     const { estado, estado_pago, notas, items } = req.body;
+    // Merge with existing values to avoid null constraint violations
+    const { rows: [existing] } = await pool.query('SELECT estado, estado_pago, notas FROM pedidos WHERE id = $1', [req.params.id]);
+    if (!existing) return res.status(404).json({ error: 'Pedido no encontrado' });
+    const newEstado = estado !== undefined ? estado : existing.estado;
+    const newEstadoPago = estado_pago !== undefined ? estado_pago : existing.estado_pago;
+    const newNotas = notas !== undefined ? notas : existing.notas;
     await pool.query('UPDATE pedidos SET estado=$1, estado_pago=$2, notas=$3, updated_at=NOW() WHERE id=$4',
-      [estado, estado_pago, notas, req.params.id]);
+      [newEstado, newEstadoPago, newNotas, req.params.id]);
 
     if (items) {
       await pool.query('DELETE FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
