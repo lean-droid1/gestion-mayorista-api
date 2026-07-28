@@ -26,7 +26,7 @@ function auth(requiredRole) {
     if (!token) return res.status(401).json({ error: 'Token requerido' });
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
-      const { rows } = await pool.query('SELECT id, usuario, nombre, rol, lista_precio_id, activo, aprobado FROM usuarios WHERE id = $1', [decoded.id]);
+      const { rows } = await pool.query('SELECT id, usuario, nombre, telefono, rol, lista_precio_id, activo, aprobado FROM usuarios WHERE id = $1', [decoded.id]);
       if (!rows[0] || !rows[0].activo) return res.status(401).json({ error: 'Usuario no válido' });
       if (requiredRole === 'admin' && rows[0].rol !== 'admin') return res.status(403).json({ error: 'Acceso denegado' });
       // Admin siempre pasa; clientes necesitan estar aprobados
@@ -43,7 +43,7 @@ async function optionalAuth(req, res, next) {
   if (!token) { req.user = null; return next(); }
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const { rows } = await pool.query('SELECT id, usuario, nombre, rol, lista_precio_id, activo, aprobado FROM usuarios WHERE id = $1', [decoded.id]);
+    const { rows } = await pool.query('SELECT id, usuario, nombre, telefono, rol, lista_precio_id, activo, aprobado FROM usuarios WHERE id = $1', [decoded.id]);
     req.user = (rows[0] && rows[0].activo && rows[0].aprobado) ? rows[0] : null;
     // Admin siempre tiene acceso
     if (rows[0] && rows[0].rol === 'admin') req.user = rows[0];
@@ -415,13 +415,17 @@ app.get('/api/pedidos', auth(), async (req, res) => {
   try {
     let query, params;
     if (req.user.rol === 'admin') {
-      query = `SELECT p.*, COALESCE(ic.item_count, 0) as item_count
-               FROM pedidos p LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
+      query = `SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, COALESCE(ic.item_count, 0) as item_count
+               FROM pedidos p
+               LEFT JOIN usuarios u ON u.id = p.usuario_id
+               LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
                ORDER BY p.created_at DESC`;
       params = [];
     } else {
-      query = `SELECT p.*, COALESCE(ic.item_count, 0) as item_count
-               FROM pedidos p LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
+      query = `SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, COALESCE(ic.item_count, 0) as item_count
+               FROM pedidos p
+               LEFT JOIN usuarios u ON u.id = p.usuario_id
+               LEFT JOIN (SELECT pedido_id, COUNT(*) as item_count FROM pedido_items GROUP BY pedido_id) ic ON ic.pedido_id = p.id
                WHERE p.usuario_id = $1 ORDER BY p.created_at DESC`;
       params = [req.user.id];
     }
@@ -432,7 +436,9 @@ app.get('/api/pedidos', auth(), async (req, res) => {
 
 app.get('/api/pedidos/:id', auth(), async (req, res) => {
   try {
-    const { rows: [pedido] } = await pool.query('SELECT * FROM pedidos WHERE id = $1', [req.params.id]);
+    const { rows: [pedido] } = await pool.query(
+      `SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono
+       FROM pedidos p LEFT JOIN usuarios u ON u.id = p.usuario_id WHERE p.id = $1`, [req.params.id]);
     if (!pedido) return res.status(404).json({ error: 'Pedido no encontrado' });
     if (req.user.rol !== 'admin' && pedido.usuario_id !== req.user.id) return res.status(403).json({ error: 'Acceso denegado' });
     const { rows: items } = await pool.query('SELECT * FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
@@ -447,7 +453,7 @@ app.post('/api/pedidos', auth(), async (req, res) => {
     const { rows: [pedido] } = await pool.query(
       `INSERT INTO pedidos (usuario_id, cliente_nombre, cliente_telefono, tipo_entrega, direccion_envio, notas, total, lista_precio_nombre)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [req.user.id, req.user.nombre, '', tipo_entrega || 'retiro', direccion_envio || '', notas || '', total, lista_precio_nombre || '']
+      [req.user.id, req.user.nombre, req.user.telefono || '', tipo_entrega || 'retiro', direccion_envio || '', notas || '', total, lista_precio_nombre || '']
     );
     for (const it of items) {
       await pool.query(
