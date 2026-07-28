@@ -15,6 +15,16 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
+// ── Migrations (safe to run multiple times) ──
+(async () => {
+  try {
+    await pool.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS metodo_pago VARCHAR(50) NOT NULL DEFAULT ''");
+    await pool.query("ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS color VARCHAR(20) NOT NULL DEFAULT '#2563eb'");
+    await pool.query("ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS promo_msg TEXT NOT NULL DEFAULT ''");
+    console.log('[DB] Migrations OK');
+  } catch (e) { console.log('[DB] Migration note:', e.message); }
+})();
+
 // ── Middleware ──
 app.use(cors({ origin: [FRONTEND_URL, 'http://localhost:5173', 'http://localhost:4173'], credentials: true }));
 app.use(express.json({ limit: '10mb' }));
@@ -174,16 +184,21 @@ app.put('/api/config', auth('admin'), async (req, res) => {
 // ══════════════════════════════════════
 app.get('/api/listas', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM listas_precio ORDER BY orden');
+    const { rows } = await pool.query('SELECT id, nombre, porcentaje, compra_minima, orden, color, promo_msg FROM listas_precio ORDER BY orden');
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/listas', auth('admin'), async (req, res) => {
   try {
-    const listas = req.body; // [{id, nombre, porcentaje, compra_minima}]
+    const listas = req.body; // [{id, nombre, porcentaje?, multiplicador?, compra_minima, color, promo_msg}]
     for (const l of listas) {
-      await pool.query('UPDATE listas_precio SET porcentaje=$1, compra_minima=$2 WHERE id=$3', [l.porcentaje, l.compra_minima || 0, l.id]);
+      // Accept either porcentaje directly or compute from multiplicador
+      const porcentaje = l.porcentaje !== undefined ? l.porcentaje : ((Number(l.multiplicador) || 1) - 1) * 100;
+      await pool.query(
+        'UPDATE listas_precio SET nombre=$1, porcentaje=$2, compra_minima=$3, color=$4, promo_msg=$5 WHERE id=$6',
+        [l.nombre, porcentaje, l.compra_minima || 0, l.color || '#2563eb', l.promo_msg || '', l.id]
+      );
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -448,12 +463,12 @@ app.get('/api/pedidos/:id', auth(), async (req, res) => {
 
 app.post('/api/pedidos', auth(), async (req, res) => {
   try {
-    const { tipo_entrega, direccion_envio, notas, items, lista_precio_nombre } = req.body;
+    const { tipo_entrega, direccion_envio, notas, items, lista_precio_nombre, metodo_pago } = req.body;
     const total = items.reduce((sum, it) => sum + (it.precio_unitario * it.cantidad), 0);
     const { rows: [pedido] } = await pool.query(
-      `INSERT INTO pedidos (usuario_id, cliente_nombre, cliente_telefono, tipo_entrega, direccion_envio, notas, total, lista_precio_nombre)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [req.user.id, req.user.nombre, req.user.telefono || '', tipo_entrega || 'retiro', direccion_envio || '', notas || '', total, lista_precio_nombre || '']
+      `INSERT INTO pedidos (usuario_id, cliente_nombre, cliente_telefono, tipo_entrega, direccion_envio, notas, total, lista_precio_nombre, metodo_pago)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [req.user.id, req.user.nombre, req.user.telefono || '', tipo_entrega || 'retiro', direccion_envio || '', notas || '', total, lista_precio_nombre || '', metodo_pago || '']
     );
     for (const it of items) {
       await pool.query(
@@ -467,15 +482,16 @@ app.post('/api/pedidos', auth(), async (req, res) => {
 
 app.put('/api/pedidos/:id', auth('admin'), async (req, res) => {
   try {
-    const { estado, estado_pago, notas, items } = req.body;
+    const { estado, estado_pago, notas, items, metodo_pago } = req.body;
     // Merge with existing values to avoid null constraint violations
-    const { rows: [existing] } = await pool.query('SELECT estado, estado_pago, notas FROM pedidos WHERE id = $1', [req.params.id]);
+    const { rows: [existing] } = await pool.query('SELECT estado, estado_pago, notas, metodo_pago FROM pedidos WHERE id = $1', [req.params.id]);
     if (!existing) return res.status(404).json({ error: 'Pedido no encontrado' });
     const newEstado = estado !== undefined ? estado : existing.estado;
     const newEstadoPago = estado_pago !== undefined ? estado_pago : existing.estado_pago;
     const newNotas = notas !== undefined ? notas : existing.notas;
-    await pool.query('UPDATE pedidos SET estado=$1, estado_pago=$2, notas=$3, updated_at=NOW() WHERE id=$4',
-      [newEstado, newEstadoPago, newNotas, req.params.id]);
+    const newMetodoPago = metodo_pago !== undefined ? metodo_pago : (existing.metodo_pago || '');
+    await pool.query('UPDATE pedidos SET estado=$1, estado_pago=$2, notas=$3, metodo_pago=$4, updated_at=NOW() WHERE id=$5',
+      [newEstado, newEstadoPago, newNotas, newMetodoPago, req.params.id]);
 
     if (items) {
       await pool.query('DELETE FROM pedido_items WHERE pedido_id = $1', [req.params.id]);
