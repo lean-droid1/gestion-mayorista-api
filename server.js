@@ -135,12 +135,16 @@ app.get('/api/auth/me', auth(), async (req, res) => {
 
 app.put('/api/auth/me', auth(), async (req, res) => {
   try {
-    const { nombre, telefono, email, direccion, password } = req.body;
+    const { nombre, usuario, telefono, email, direccion, password } = req.body;
+    if (usuario) {
+      const { rows: dup } = await pool.query('SELECT id FROM usuarios WHERE usuario = $1 AND id != $2', [usuario, req.user.id]);
+      if (dup.length) return res.status(400).json({ error: 'Ese nombre de usuario ya existe' });
+    }
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, password_hash=$5, updated_at=NOW() WHERE id=$6', [nombre, telefono, email, direccion, hash, req.user.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, password_hash=$6, updated_at=NOW() WHERE id=$7', [nombre, usuario, telefono, email, direccion, hash, req.user.id]);
     } else {
-      await pool.query('UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, updated_at=NOW() WHERE id=$5', [nombre, telefono, email, direccion, req.user.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, updated_at=NOW() WHERE id=$6', [nombre, usuario, telefono, email, direccion, req.user.id]);
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -346,14 +350,19 @@ app.get('/api/usuarios/pendientes/count', auth('admin'), async (req, res) => {
 
 app.put('/api/usuarios/:id', auth('admin'), async (req, res) => {
   try {
-    const { nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, password, permisos, notas_admin } = req.body;
+    const { nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, password, permisos, notas_admin } = req.body;
+    // Verificar usuario único si se cambió
+    if (usuario) {
+      const { rows: dup } = await pool.query('SELECT id FROM usuarios WHERE usuario = $1 AND id != $2', [usuario, req.params.id]);
+      if (dup.length) return res.status(400).json({ error: 'Ese nombre de usuario ya existe' });
+    }
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, rol=$5, lista_precio_id=$6, activo=$7, aprobado=$8, password_hash=$9, permisos=$10, notas_admin=$11, updated_at=NOW() WHERE id=$12',
-        [nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, hash, permisos || '', notas_admin || '', req.params.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, rol=$6, lista_precio_id=$7, activo=$8, aprobado=$9, password_hash=$10, permisos=$11, notas_admin=$12, updated_at=NOW() WHERE id=$13',
+        [nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, hash, permisos || '', notas_admin || '', req.params.id]);
     } else {
-      await pool.query('UPDATE usuarios SET nombre=$1, telefono=$2, email=$3, direccion=$4, rol=$5, lista_precio_id=$6, activo=$7, aprobado=$8, permisos=$9, notas_admin=$10, updated_at=NOW() WHERE id=$11',
-        [nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, permisos || '', notas_admin || '', req.params.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, rol=$6, lista_precio_id=$7, activo=$8, aprobado=$9, permisos=$10, notas_admin=$11, updated_at=NOW() WHERE id=$12',
+        [nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, permisos || '', notas_admin || '', req.params.id]);
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -373,10 +382,26 @@ app.post('/api/usuarios/:id/rechazar', auth('admin'), async (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Suspender usuario (soft)
+app.put('/api/usuarios/:id/suspender', auth('admin'), async (req, res) => {
+  try {
+    if (parseInt(req.params.id) === req.user.id) return res.status(400).json({ error: 'No podés suspenderte' });
+    const { activo } = req.body;
+    await pool.query('UPDATE usuarios SET activo = $1, updated_at = NOW() WHERE id = $2', [activo ?? false, req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Eliminar usuario (real delete, preserva pedidos para estadísticas)
 app.delete('/api/usuarios/:id', auth('admin'), async (req, res) => {
   try {
     if (parseInt(req.params.id) === req.user.id) return res.status(400).json({ error: 'No podés eliminarte' });
-    await pool.query('UPDATE usuarios SET activo = false WHERE id = $1', [req.params.id]);
+    // Guardar nombre en pedidos antes de borrar
+    await pool.query(`UPDATE pedidos SET cliente_nombre = COALESCE(cliente_nombre, (SELECT nombre FROM usuarios WHERE id = $1)),
+      cliente_telefono = COALESCE(cliente_telefono, (SELECT telefono FROM usuarios WHERE id = $1))
+      WHERE usuario_id = $1`, [req.params.id]);
+    await pool.query('UPDATE pedidos SET usuario_id = NULL WHERE usuario_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM usuarios WHERE id = $1', [req.params.id]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -384,13 +409,13 @@ app.delete('/api/usuarios/:id', auth('admin'), async (req, res) => {
 // ══ PEDIDOS ══
 app.get('/api/pedidos', auth(), async (req, res) => {
   try {
-    const { tipo, archivado, cancelados } = req.query;
+    const { tipo, archivado, cancelados, all } = req.query;
     let whereExtra = '';
     if (archivado === 'true') whereExtra += ' AND p.archivado = true';
     else whereExtra += ' AND p.archivado = false';
     if (tipo) whereExtra += ` AND p.tipo = '${tipo === 'presupuesto' ? 'presupuesto' : 'pedido'}'`;
     if (cancelados === 'true') whereExtra += " AND p.estado = 'cancelado'";
-    else if (!archivado || archivado !== 'true') whereExtra += " AND p.estado != 'cancelado'";
+    else if (all !== 'true' && (!archivado || archivado !== 'true')) whereExtra += " AND p.estado != 'cancelado'";
     const isAdmin = req.user.rol === 'admin' || req.user.rol === 'subadmin';
     const base = `SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, COALESCE(ic.item_count, 0) as item_count
       FROM pedidos p LEFT JOIN usuarios u ON u.id = p.usuario_id
