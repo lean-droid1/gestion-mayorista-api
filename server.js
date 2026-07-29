@@ -7,7 +7,7 @@ const jwt = require('jsonwebtoken');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'mayorista-secret-key-change-me';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://lean-droidmayorista.netlify.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mayorista.lean-droidgremio.com';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -31,6 +31,7 @@ const pool = new Pool({
       "ALTER TABLE productos ADD COLUMN IF NOT EXISTS notas TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS notas_admin TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS permisos TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nombre_fantasia TEXT NOT NULL DEFAULT ''",
       "INSERT INTO configuracion (clave, valor) VALUES ('metodos_pago', '') ON CONFLICT (clave) DO NOTHING",
       "INSERT INTO configuracion (clave, valor) VALUES ('alertas_stock', 'false') ON CONFLICT (clave) DO NOTHING",
       `CREATE TABLE IF NOT EXISTS historial_precios (
@@ -49,7 +50,7 @@ const pool = new Pool({
   } catch (e) { console.log('[DB] Migration note:', e.message); }
 })();
 
-app.use(cors({ origin: [FRONTEND_URL, 'http://localhost:5173', 'http://localhost:4173'], credentials: true }));
+app.use(cors({ origin: [FRONTEND_URL, 'https://mayorista.lean-droidgremio.com', /\.vercel\.app$/, 'http://localhost:5173', 'http://localhost:4173'], credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
 // ── Auth ──
@@ -111,7 +112,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { usuario, password, nombre, telefono, email, direccion } = req.body;
+    const { usuario, password, nombre, telefono, email, direccion, nombre_fantasia } = req.body;
     if (!usuario || !password) return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
     if (!nombre) return res.status(400).json({ error: 'Nombre requerido' });
     if (!telefono) return res.status(400).json({ error: 'Teléfono requerido' });
@@ -119,8 +120,8 @@ app.post('/api/auth/register', async (req, res) => {
     if (exists.rows[0]) return res.status(409).json({ error: 'El usuario ya existe' });
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      'INSERT INTO usuarios (usuario, password_hash, nombre, telefono, email, direccion, rol, lista_precio_id, aprobado) VALUES ($1,$2,$3,$4,$5,$6,$7,4,$8) RETURNING *',
-      [usuario, hash, nombre, telefono || '', email || '', direccion || '', 'cliente', false]);
+      'INSERT INTO usuarios (usuario, password_hash, nombre, telefono, email, direccion, nombre_fantasia, rol, lista_precio_id, aprobado) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,4,$9) RETURNING *',
+      [usuario, hash, nombre, telefono || '', email || '', direccion || '', nombre_fantasia || '', 'cliente', false]);
     const { password_hash, ...user } = rows[0];
     res.status(201).json({ pendiente: true, mensaje: 'Registro exitoso. Tu cuenta será revisada.', user: { nombre: user.nombre, usuario: user.usuario, telefono: user.telefono, email: user.email } });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -128,23 +129,23 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.get('/api/auth/me', auth(), async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, aprobado, permisos, created_at FROM usuarios WHERE id = $1', [req.user.id]);
+    const { rows } = await pool.query('SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, aprobado, permisos, nombre_fantasia, created_at FROM usuarios WHERE id = $1', [req.user.id]);
     res.json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.put('/api/auth/me', auth(), async (req, res) => {
   try {
-    const { nombre, usuario, telefono, email, direccion, password } = req.body;
+    const { nombre, usuario, telefono, email, direccion, password, nombre_fantasia } = req.body;
     if (usuario) {
       const { rows: dup } = await pool.query('SELECT id FROM usuarios WHERE usuario = $1 AND id != $2', [usuario, req.user.id]);
       if (dup.length) return res.status(400).json({ error: 'Ese nombre de usuario ya existe' });
     }
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, password_hash=$6, updated_at=NOW() WHERE id=$7', [nombre, usuario, telefono, email, direccion, hash, req.user.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, password_hash=$6, nombre_fantasia=$7, updated_at=NOW() WHERE id=$8', [nombre, usuario, telefono, email, direccion, hash, nombre_fantasia || '', req.user.id]);
     } else {
-      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, updated_at=NOW() WHERE id=$6', [nombre, usuario, telefono, email, direccion, req.user.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, nombre_fantasia=$6, updated_at=NOW() WHERE id=$7', [nombre, usuario, telefono, email, direccion, nombre_fantasia || '', req.user.id]);
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -332,7 +333,7 @@ app.put('/api/precios-fijos', auth('admin'), async (req, res) => {
 app.get('/api/usuarios', auth('admin'), async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, permisos, notas_admin, created_at,
+      `SELECT id, usuario, nombre, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, permisos, notas_admin, nombre_fantasia, created_at,
        CASE WHEN aprobado = false AND activo = true AND rol = 'cliente' THEN 'pendiente'
             WHEN activo = false THEN 'suspendido'
             ELSE 'activo' END as estado
@@ -350,7 +351,7 @@ app.get('/api/usuarios/pendientes/count', auth('admin'), async (req, res) => {
 
 app.put('/api/usuarios/:id', auth('admin'), async (req, res) => {
   try {
-    const { nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, password, permisos, notas_admin } = req.body;
+    const { nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, password, permisos, notas_admin, nombre_fantasia } = req.body;
     // Verificar usuario único si se cambió
     if (usuario) {
       const { rows: dup } = await pool.query('SELECT id FROM usuarios WHERE usuario = $1 AND id != $2', [usuario, req.params.id]);
@@ -358,11 +359,11 @@ app.put('/api/usuarios/:id', auth('admin'), async (req, res) => {
     }
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, rol=$6, lista_precio_id=$7, activo=$8, aprobado=$9, password_hash=$10, permisos=$11, notas_admin=$12, updated_at=NOW() WHERE id=$13',
-        [nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, hash, permisos || '', notas_admin || '', req.params.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, rol=$6, lista_precio_id=$7, activo=$8, aprobado=$9, password_hash=$10, permisos=$11, notas_admin=$12, nombre_fantasia=$13, updated_at=NOW() WHERE id=$14',
+        [nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, hash, permisos || '', notas_admin || '', nombre_fantasia || '', req.params.id]);
     } else {
-      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, rol=$6, lista_precio_id=$7, activo=$8, aprobado=$9, permisos=$10, notas_admin=$11, updated_at=NOW() WHERE id=$12',
-        [nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, permisos || '', notas_admin || '', req.params.id]);
+      await pool.query('UPDATE usuarios SET nombre=$1, usuario=$2, telefono=$3, email=$4, direccion=$5, rol=$6, lista_precio_id=$7, activo=$8, aprobado=$9, permisos=$10, notas_admin=$11, nombre_fantasia=$12, updated_at=NOW() WHERE id=$13',
+        [nombre, usuario, telefono, email, direccion, rol, lista_precio_id, activo, aprobado, permisos || '', notas_admin || '', nombre_fantasia || '', req.params.id]);
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
