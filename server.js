@@ -383,6 +383,16 @@ app.post('/api/usuarios/:id/rechazar', auth('admin'), async (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Reset password a "1234"
+app.post('/api/usuarios/:id/reset-password', auth('admin'), async (req, res) => {
+  try {
+    const hash = await bcrypt.hash('1234', 10);
+    await pool.query('UPDATE usuarios SET password_hash = $1, updated_at = NOW() WHERE id = $2', [hash, req.params.id]);
+    const { rows: [u] } = await pool.query('SELECT id, nombre, usuario, telefono FROM usuarios WHERE id = $1', [req.params.id]);
+    res.json({ ok: true, user: u });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Suspender usuario (soft)
 app.put('/api/usuarios/:id/suspender', auth('admin'), async (req, res) => {
   try {
